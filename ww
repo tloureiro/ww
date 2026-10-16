@@ -1,0 +1,1324 @@
+#!/usr/bin/env python3
+"""Small, dependency-free WordPress wrapper around Lando."""
+
+from __future__ import annotations
+
+import html
+import json
+import os
+import re
+import select
+import shutil
+import subprocess
+import sys
+import termios
+import textwrap
+import tty
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+
+MARKER = ".ww.json"
+LANDOFILE = ".lando.yml"
+WP_CONFIG = "wp-cli.yml"
+ADMIN_USER = "admin"
+ADMIN_PASSWORD = "admin"
+ADMIN_EMAIL = "a@a.com"
+PLUGIN_API = "https://api.wordpress.org/plugins/info/1.2/"
+TRICKS_DIR = Path(__file__).resolve().parent / "tricks"
+COMMANDS = ("create", "wp", "plugin", "tricks", "list", "start", "stop", "stop-all", "status", "info", "reset-db", "destroy", "help")
+
+# Collect the overview in one WordPress bootstrap instead of starting WP-CLI
+# separately for every field. Skip normal plugins/themes so broken extensions
+# do not prevent inspecting their configured activation state.
+INSTANCE_INFO_PHP = r'''
+global $wpdb, $wp_version;
+require_once ABSPATH . 'wp-admin/includes/plugin.php';
+$active = (array) get_option('active_plugins', array());
+$network_active = is_multisite() ? (array) get_site_option('active_sitewide_plugins', array()) : array();
+$plugins = array();
+foreach (get_plugins() as $file => $plugin) {
+    $plugins[] = array(
+        'name' => $plugin['Name'],
+        'slug' => strpos($file, '/') === false ? basename($file, '.php') : dirname($file),
+        'version' => $plugin['Version'],
+        'status' => isset($network_active[$file]) ? 'network-active' : (in_array($file, $active, true) ? 'active' : 'inactive'),
+    );
+}
+foreach (array('must-use' => get_mu_plugins(), 'drop-in' => get_dropins()) as $status => $extensions) {
+    foreach ($extensions as $file => $plugin) {
+        $plugins[] = array('name' => $plugin['Name'], 'slug' => $file, 'version' => $plugin['Version'], 'status' => $status);
+    }
+}
+$theme = wp_get_theme();
+$parent = $theme->parent();
+$users = count_users();
+$previous_suppress = $wpdb->suppress_errors(true);
+$database = $wpdb->get_row(
+    'SELECT COUNT(*) AS tables, COALESCE(SUM(DATA_LENGTH + INDEX_LENGTH), 0) AS bytes
+     FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()', ARRAY_A
+);
+$database_version = $wpdb->get_var('SELECT VERSION()');
+$wpdb->suppress_errors($previous_suppress);
+echo wp_json_encode(array(
+    'title' => get_option('blogname'),
+    'url' => home_url(),
+    'admin_url' => admin_url(),
+    'wordpress' => $wp_version,
+    'php' => PHP_VERSION,
+    'database_name' => DB_NAME,
+    'database_version' => $database_version,
+    'database' => $database,
+    'theme' => array('name' => $theme->get('Name'), 'slug' => $theme->get_stylesheet(), 'version' => $theme->get('Version')),
+    'parent_theme' => $parent ? array('name' => $parent->get('Name'), 'slug' => $parent->get_stylesheet(), 'version' => $parent->get('Version')) : null,
+    'users' => (int) $users['total_users'],
+    'posts' => (int) wp_count_posts('post')->publish,
+    'pages' => (int) wp_count_posts('page')->publish,
+    'multisite' => is_multisite(),
+    'sites' => is_multisite() ? (int) get_sites(array('count' => true)) : 1,
+    'debug' => defined('WP_DEBUG') && WP_DEBUG,
+    'plugins' => $plugins,
+));
+'''
+
+
+class WWError(Exception):
+    """A user-facing error."""
+
+
+def run(argv: list[str], root: Path | None = None, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            argv,
+            cwd=root,
+            text=True,
+            stdin=None,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.PIPE if capture else None,
+            check=False,
+        )
+    except OSError as exc:
+        raise WWError(f"Could not run {argv[0]}: {exc}") from exc
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip() if capture else ""
+        raise WWError(f"{' '.join(argv[:2])} failed (exit {result.returncode})" + (f": {detail}" if detail else ""))
+    return result
+
+
+def require_lando() -> None:
+    if shutil.which("lando") is None:
+        raise WWError("Lando is required. Install it and make sure `lando` is on PATH.")
+
+
+def project_root(start: Path | None = None) -> Path:
+    start = (start or Path.cwd()).resolve()
+    for path in (start, *start.parents):
+        if (path / MARKER).is_file():
+            if not (path / LANDOFILE).is_file():
+                raise WWError(f"{path / LANDOFILE} is missing from this ww project.")
+            return path
+    raise WWError("No ww project found in this folder or its parents.")
+
+
+def read_marker(root: Path) -> dict[str, Any]:
+    try:
+        data = json.loads((root / MARKER).read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WWError(f"Cannot read {root / MARKER}: {exc}") from exc
+    if not isinstance(data, dict) or data.get("schema") != 1 or not isinstance(data.get("name"), str) or not isinstance(data.get("title"), str):
+        raise WWError(f"Invalid {root / MARKER}.")
+    return data
+
+
+def normalized_app_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def app_name(root: Path, records: list[dict[str, Any]]) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", root.name.lower()).strip("-")[:40].strip("-") or "site"
+    taken = {
+        normalized_app_name(name)
+        for record in records if record.get("kind") != "service"
+        if isinstance((name := record.get("app", record.get("appName"))), str)
+    }
+    candidate = slug
+    number = 1
+    while normalized_app_name(candidate) in taken:
+        candidate = f"{slug}-{number}"
+        number += 1
+    return candidate
+
+
+def site_title(root: Path) -> str:
+    return re.sub(r"[-_]+", " ", root.name).strip() or "WordPress"
+
+
+def yaml_string(value: str) -> str:
+    # JSON quoted strings are also valid YAML strings.
+    return json.dumps(value)
+
+
+def write_project(root: Path, name: str, title: str) -> None:
+    db_path = str(root / "db")
+    landofile = (
+        f"name: {yaml_string(name)}\n"
+        "recipe: wordpress\n"
+        "config:\n"
+        "  webroot: wordpress\n"
+        "  php: '8.3'\n"
+        "  database: mysql:8.0\n"
+        "services:\n"
+        "  database:\n"
+        "    overrides:\n"
+        "      volumes:\n"
+        f"        - type: bind\n          source: {yaml_string(db_path)}\n          target: /bitnami/mysql/data\n"
+    )
+    (root / LANDOFILE).write_text(landofile)
+    (root / WP_CONFIG).write_text("path: wordpress\n")
+    (root / MARKER).write_text(json.dumps({"schema": 1, "name": name, "title": title}, indent=2) + "\n")
+    ignore = root / ".gitignore"
+    if ignore.exists():
+        existing = ignore.read_text()
+        if "db/" not in existing.splitlines():
+            ignore.write_text(existing + ("" if existing.endswith("\n") else "\n") + "db/\n")
+    else:
+        ignore.write_text("db/\n")
+
+
+def install_site(root: Path, marker: dict[str, Any], download: bool) -> None:
+    if download:
+        run(["lando", "wp", "core", "download"], root)
+    if not (root / "wordpress" / "wp-config.php").is_file():
+        run([
+            "lando", "wp", "config", "create", "--dbname=wordpress", "--dbuser=wordpress",
+            "--dbpass=wordpress", "--dbhost=database",
+        ], root)
+    run([
+        "lando", "wp", "core", "install", f"--url=https://{marker['name']}.lndo.site",
+        f"--title={marker['title']}", f"--admin_user={ADMIN_USER}",
+        f"--admin_password={ADMIN_PASSWORD}", f"--admin_email={ADMIN_EMAIL}", "--skip-email",
+    ], root)
+
+
+def create(root: Path | None = None) -> None:
+    root = (root or Path.cwd()).resolve()
+    for path in (root, *root.parents):
+        if os.path.lexists(path / LANDOFILE) or os.path.lexists(path / MARKER):
+            raise WWError(f"An environment already exists at {path}.")
+    if (root / ".gitignore").is_symlink():
+        raise WWError("Refusing to edit a symlinked .gitignore.")
+    conflicts = [name for name in ("wordpress", "db", WP_CONFIG) if os.path.lexists(root / name)]
+    if conflicts:
+        raise WWError("Refusing to overwrite: " + ", ".join(conflicts))
+    require_lando()
+    name, title = app_name(root, _list_records()), site_title(root)
+    try:
+        (root / "wordpress").mkdir()
+        (root / "db").mkdir()
+        write_project(root, name, title)
+        marker = read_marker(root)
+        run(["lando", "start"], root)
+        install_site(root, marker, download=True)
+    except (WWError, OSError, UnicodeError) as exc:
+        raise WWError(
+            f"Creation stopped: {exc}. Any project files were kept at {root}. "
+            "Inspect them before retrying; see the README recovery guide."
+        ) from exc
+    print(f"Site: https://{name}.lndo.site")
+    print(f"Admin: {ADMIN_USER} / {ADMIN_PASSWORD} ({ADMIN_EMAIL})")
+    print(f"Project: {root}")
+
+
+def confirm(action: str, root: Path) -> bool:
+    if not sys.stdin.isatty():
+        raise WWError(f"{action} requires an interactive terminal for confirmation.")
+    try:
+        response = input(f"{action} database data for {root}? Type yes to continue: ")
+    except EOFError:
+        return False
+    return response.strip().lower() == "yes"
+
+
+def database_path(root: Path) -> Path:
+    """Reject unsafe local data paths before invoking destructive Lando actions."""
+    db = root / "db"
+    if db.is_symlink():
+        raise WWError(f"Refusing to remove symlink: {db}")
+    if db.exists() and not db.is_dir():
+        raise WWError(f"Expected a directory: {db}")
+    return db
+
+
+def remove_db(root: Path) -> None:
+    db = database_path(root)
+    if db.exists():
+        shutil.rmtree(db)
+
+
+def reset_db(root: Path) -> None:
+    marker = read_marker(root)
+    database_path(root)
+    if not confirm("Delete and reinstall", root):
+        print("Cancelled.")
+        return
+    run(["lando", "stop"], root)
+    try:
+        remove_db(root)
+        (root / "db").mkdir()
+        run(["lando", "start"], root)
+        install_site(root, marker, download=False)
+    except (WWError, OSError) as exc:
+        raise WWError(
+            f"Database reset stopped: {exc}. Database data may already be deleted; "
+            "WordPress files were kept. Inspect the site before retrying."
+        ) from exc
+    print(f"Database reset. Site: https://{marker['name']}.lndo.site")
+    print(f"Admin: {ADMIN_USER} / {ADMIN_PASSWORD} ({ADMIN_EMAIL})")
+
+
+def destroy(root: Path) -> None:
+    database_path(root)
+    if not confirm("Destroy", root):
+        print("Cancelled.")
+        return
+    run(["lando", "destroy", "-y"], root)
+    try:
+        remove_db(root)
+    except (WWError, OSError) as exc:
+        raise WWError(
+            f"Environment destroyed, but local database cleanup failed: {exc}. "
+            "Inspect db/ before starting the retained site."
+        ) from exc
+    print(f"Destroyed environment at {root}. WordPress files and configuration were kept.")
+
+
+def _list_records() -> list[dict[str, Any]]:
+    result = run(["lando", "list", "--all", "--format=json"], capture=True)
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise WWError("Lando returned invalid JSON from `lando list`.") from exc
+    if isinstance(data, dict):
+        data = data.get("containers", data.get("data"))
+    if not isinstance(data, list):
+        raise WWError("Unexpected `lando list` response.")
+    return [record for record in data if isinstance(record, dict)]
+
+
+def _container_ref(record: dict[str, Any]) -> str | None:
+    for key in ("id", "container", "containerId", "name"):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _container_root(record: dict[str, Any]) -> Path | None:
+    sources = record.get("src")
+    if isinstance(sources, str):
+        sources = [sources]
+    if isinstance(sources, list):
+        for source in sources:
+            if isinstance(source, str) and Path(source).name == LANDOFILE:
+                return Path(source).resolve().parent
+    ref = _container_ref(record)
+    if not ref:
+        return None
+    result = run(["docker", "inspect", ref], capture=True, check=False)
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        return None
+    if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+        return None
+    mounts = data[0].get("Mounts", [])
+    if not isinstance(mounts, list):
+        return None
+    for mount in mounts:
+        if not isinstance(mount, dict):
+            continue
+        if mount.get("Destination") == "/app" and mount.get("Type") == "bind":
+            source = mount.get("Source")
+            if isinstance(source, str):
+                return Path(source).resolve()
+    return None
+
+
+def _is_running(record: dict[str, Any]) -> bool:
+    if isinstance(record.get("running"), bool):
+        return record["running"]
+    state = str(record.get("status", record.get("state", ""))).lower()
+    return state.startswith(("up", "running"))
+
+
+def list_projects() -> list[dict[str, str]]:
+    grouped: dict[Path, list[dict[str, Any]]] = {}
+    for record in _list_records():
+        if record.get("kind") == "service":
+            continue
+        root = _container_root(record)
+        if root is not None and (root / MARKER).is_file():
+            grouped.setdefault(root, []).append(record)
+    projects = []
+    for root, records in grouped.items():
+        try:
+            marker = read_marker(root)
+        except WWError:
+            continue
+        expected = re.sub(r"[^a-z0-9]", "", marker["name"].lower())
+        names = {re.sub(r"[^a-z0-9]", "", str(record.get("app", record.get("appName", ""))).lower()) for record in records}
+        if expected not in names:
+            continue
+        running = sum(_is_running(record) for record in records)
+        status = "running" if running == len(records) else "stopped" if running == 0 else "partial"
+        projects.append({"name": marker["name"], "status": status, "root": str(root)})
+    return sorted(projects, key=lambda item: (item["name"], item["root"]))
+
+
+def show_list() -> None:
+    projects = list_projects()
+    if not projects:
+        print("No ww environments found.")
+        return
+    width = max(len("NAME"), *(len(item["name"]) for item in projects))
+    print(f"{'NAME':<{width}}  STATUS   FOLDER")
+    for item in projects:
+        print(f"{item['name']:<{width}}  {item['status']:<7}  {item['root']}")
+
+
+def stop_all() -> None:
+    projects = [item for item in list_projects() if item["status"] in ("running", "partial")]
+    if not projects:
+        print("No running ww sites found.")
+        return
+    failed = []
+    for item in projects:
+        print(f"Stopping {item['name']} ({item['root']})...", flush=True)
+        try:
+            run(["lando", "stop"], project_root(Path(item["root"])))
+        except WWError as exc:
+            failed.append(item["name"])
+            print(f"ww: Could not stop {item['name']} ({item['root']}): {exc}", file=sys.stderr)
+    stopped = len(projects) - len(failed)
+    print(f"Stopped {stopped} ww site{'s' if stopped != 1 else ''}.")
+    if failed:
+        raise WWError(f"Failed to stop {len(failed)} ww site{'s' if len(failed) != 1 else ''}: {', '.join(failed)}.")
+
+
+def named_project_root(name: str) -> Path:
+    matches = [item for item in list_projects() if item["name"] == name]
+    if not matches:
+        raise WWError(f"No ww environment named {name!r} found.")
+    if len(matches) > 1:
+        raise WWError(f"More than one ww environment is named {name!r}; run the command from its folder.")
+    return project_root(Path(matches[0]["root"]))
+
+
+def instance_info(root: Path) -> dict[str, Any]:
+    result = run([
+        "lando", "wp", "eval", INSTANCE_INFO_PHP,
+        "--skip-plugins", "--skip-themes", "--quiet",
+    ], root, capture=True)
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise WWError("WP-CLI returned invalid instance information.") from exc
+    if (
+        not isinstance(data, dict)
+        or not isinstance(data.get("theme"), dict)
+        or not isinstance(data.get("plugins"), list)
+        or not all(isinstance(plugin, dict) for plugin in data["plugins"])
+    ):
+        raise WWError("Unexpected WP-CLI instance information.")
+    return data
+
+
+def format_bytes(value: int) -> str:
+    size = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+        if size < 1024 or unit == "PiB":
+            return f"{int(size)} B" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    raise AssertionError("unreachable")
+
+
+def _extension_label(extension: dict[str, Any]) -> str:
+    name = _plugin_text(extension.get("name") or extension.get("slug") or "unknown")
+    version = _plugin_text(extension.get("version") or "")
+    slug = _plugin_text(extension.get("slug") or "")
+    return name + (f" {version}" if version else "") + (f" ({slug})" if slug else "")
+
+
+def _status_wrap(value: str, width: int) -> list[str]:
+    lines = []
+    for line in textwrap.wrap(value, width=width, break_on_hyphens=False):
+        while _terminal_width(line) > width:
+            prefix = _terminal_text(line, width)
+            space = prefix.rfind(" ")
+            if space > 0:
+                prefix = prefix[:space]
+            lines.append(prefix)
+            line = line[len(prefix):].lstrip()
+        if line:
+            lines.append(line)
+    return lines
+
+
+class _StatusOutput:
+    """Static overview, with color only when writing to a capable terminal."""
+
+    def __init__(self) -> None:
+        self.width = max(24, min(shutil.get_terminal_size((90, 24)).columns, 100))
+        self.use_color = sys.stdout.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
+
+    def color(self, value: str, style: str) -> str:
+        return f"\x1b[{style}m{value}\x1b[0m" if self.use_color else value
+
+    def status_color(self, state: str) -> str:
+        if state in ("running", "active", "network-active"):
+            return "32"
+        if state in ("partial", "unknown"):
+            return "33"
+        if state == "stopped":
+            return "31"
+        return "36" if state in ("must-use", "drop-in") else "2"
+
+    def header(self, name: str, state: str, root: Path) -> None:
+        print()
+        print("  " + self.color(_plugin_text(name), "1") + "  " + self.color(f"● {state}", self.status_color(state)))
+        self.field("Folder", root, "2")
+
+    def section(self, title: str) -> None:
+        print()
+        rule = "─" * max(0, self.width - len(title) - 5)
+        print("  " + self.color(title.upper(), "1;36") + " " + self.color(rule, "2"))
+
+    def field(self, label: str, value: Any, style: str = "0") -> None:
+        label_width = 14
+        value = _plugin_text(value)
+        if self.width < 48:
+            print("  " + self.color(label + ":", "2"))
+            indent = "    "
+        else:
+            indent = " " * (label_width + 2)
+        lines = _status_wrap(value, max(2, self.width - len(indent))) or [""]
+        for index, line in enumerate(lines):
+            prefix = "  " + self.color((label + ":").ljust(label_width), "2") if index == 0 and self.width >= 48 else indent
+            print(prefix + self.color(line, style))
+
+    def note(self, value: str) -> None:
+        for line in _status_wrap(value, self.width - 4):
+            print("    " + self.color(line, "2"))
+
+    def plugins(self, plugins: list[dict[str, Any]]) -> None:
+        if not plugins:
+            return
+        versions = [_plugin_text(plugin.get("version") or "—") for plugin in plugins]
+        states = [_plugin_text(plugin.get("status") or "unknown") for plugin in plugins]
+        version_width = max(7, *(_terminal_width(version) for version in versions))
+        state_width = max(6, *(_terminal_width(state) for state in states))
+        name_width = self.width - version_width - state_width - 6
+        if name_width >= 24:
+            heading = "  " + _terminal_cell("PLUGIN", name_width) + "  " + _terminal_cell("VERSION", version_width) + "  STATUS"
+            print(self.color(heading, "2"))
+        for plugin, version, state in zip(plugins, versions, states):
+            if name_width < 24:
+                self.note(_extension_label(plugin))
+                print("    " + self.color(state, self.status_color(state)))
+                continue
+            name = _plugin_text(plugin.get("name") or plugin.get("slug") or "unknown")
+            slug = _plugin_text(plugin.get("slug") or "")
+            # Wrap long names rather than hiding part of the installed inventory.
+            names = _status_wrap(name + (f" ({slug})" if slug else ""), name_width)
+            for index, line in enumerate(names):
+                row = "  " + _terminal_cell(line, name_width)
+                if index == 0:
+                    row += "  " + self.color(_terminal_cell(version, version_width), "2") + "  " + self.color(state, self.status_color(state))
+                print(row.rstrip())
+
+
+def show_status(root: Path) -> None:
+    marker = read_marker(root)
+    output = _StatusOutput()
+    try:
+        row = next((item for item in list_projects() if item["root"] == str(root)), None)
+    except WWError as exc:
+        output.header(marker["name"], "unknown", root)
+        raise WWError(f"Could not determine instance state: {exc}") from exc
+    state = row["status"] if row else "destroyed or not started"
+    output.header(marker["name"], state, root)
+    if state != "running":
+        print()
+        output.note("WordPress details are available when the instance is fully running.")
+        print()
+        return
+    try:
+        data = instance_info(root)
+    except WWError as exc:
+        output.section("WordPress")
+        output.field("WordPress", "unavailable", "31")
+        print()
+        raise WWError(f"Could not read WordPress details: {exc}") from exc
+    output.section("Site")
+    for label, key in (("Site", "title"), ("URL", "url"), ("Admin", "admin_url")):
+        output.field(label, data.get(key, "unavailable"), "36" if key.endswith("url") else "1")
+    output.section("WordPress")
+    output.field("WordPress", data.get("wordpress", "unavailable"), "1")
+    output.field("PHP", data.get("php", "unavailable"))
+    output.field("Theme", _extension_label(data["theme"]))
+    if isinstance(data.get("parent_theme"), dict):
+        output.field("Parent theme", _extension_label(data["parent_theme"]))
+    output.field("Users", f"{data.get('users', '?')}" + (" (this site)" if data.get("multisite") else ""))
+    content = []
+    for key, label in (("posts", "post"), ("pages", "page")):
+        count = data.get(key, "?")
+        content.append(f"{_plugin_text(count)} published {label}{'' if count == 1 else 's'}")
+    output.field("Content", ", ".join(content))
+    sites = data.get("sites", "?")
+    output.field("Multisite", f"yes ({sites} site{'' if sites == 1 else 's'})" if data.get("multisite") else "no")
+    output.field("Debug", "on" if data.get("debug") else "off", "33" if data.get("debug") else "2")
+    output.section("Database")
+    output.field("Database", data.get("database_name", "unknown"))
+    output.field("Server", data.get("database_version") or "unknown")
+    database = data.get("database")
+    if isinstance(database, dict) and (size := _plugin_number(database.get("bytes"))) is not None:
+        output.field("DB size", f"{format_bytes(size)} · {database.get('tables', '?')} tables", "1")
+        output.note("Approximate total of table data + indexes.")
+    else:
+        output.field("DB size", "unavailable", "33")
+    plugins = data["plugins"]
+    regular = [plugin for plugin in plugins if plugin.get("status") in ("active", "network-active", "inactive")]
+    active = sum(plugin.get("status") in ("active", "network-active") for plugin in regular)
+    summary = f"{len(regular)} installed, {active} active, {len(regular) - active} inactive"
+    for status in ("must-use", "drop-in"):
+        count = sum(plugin.get("status") == status for plugin in plugins)
+        if count:
+            summary += f", {count} {status}"
+    output.section("Plugins")
+    output.field("Plugins", summary)
+    print()
+    output.plugins(sorted(plugins, key=lambda plugin: _plugin_text(plugin.get("name", "")).casefold()))
+    print()
+
+
+def _plugin_information(slug: str, include_versions: bool = False) -> dict[str, Any] | None:
+    params = {
+        "action": "plugin_information",
+        "request[slug]": slug,
+        "request[fields][versions]": "1" if include_versions else "0",
+    }
+    query = urllib.parse.urlencode(params)
+    request = urllib.request.Request(f"{PLUGIN_API}?{query}", headers={"User-Agent": "ww (local WordPress helper)"})
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            data = json.load(response)
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        if exc.code == 404:
+            return None
+        raise WWError(f"Could not check the WordPress.org plugin directory: {exc}") from exc
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        raise WWError(f"Could not check the WordPress.org plugin directory: {exc}") from exc
+    return data if isinstance(data, dict) and data.get("slug") == slug else None
+
+
+def exact_plugin(slug: str) -> dict[str, Any] | None:
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug):
+        return None
+    return _plugin_information(slug)
+
+
+def _version_key(version: str) -> tuple[tuple[int, ...], int, str]:
+    match = re.match(r"^(\d+(?:\.\d+)*)(.*)$", version)
+    if match is None:
+        return (), 0, version.lower()
+    numbers = tuple(int(part) for part in match.group(1).split("."))
+    suffix = match.group(2).lower()
+    return numbers, 1 if not suffix else 0, suffix
+
+
+def plugin_versions(slug: str) -> tuple[list[str], str]:
+    info = _plugin_information(slug, include_versions=True)
+    if info is None:
+        raise WWError(f"WordPress.org could not find plugin {slug!r}.")
+    available = info.get("versions")
+    if not isinstance(available, dict):
+        raise WWError(f"WordPress.org did not provide versions for {slug!r}.")
+    versions = [
+        version for version, url in available.items()
+        if isinstance(version, str) and re.fullmatch(r"\d[0-9A-Za-z._-]*", version)
+        and isinstance(url, str) and url
+    ]
+    current = info.get("version") if isinstance(info.get("version"), str) else ""
+    if re.fullmatch(r"\d[0-9A-Za-z._-]*", current) and current not in versions:
+        versions.append(current)
+    versions.sort(key=_version_key, reverse=True)
+    if not versions:
+        raise WWError(f"No published versions were found for {slug!r}.")
+    return versions, current
+
+
+def search_plugins(root: Path, query: str) -> list[dict[str, Any]]:
+    result = run([
+        "lando", "wp", "plugin", "search", query, "--per-page=10",
+        "--fields=name,slug,version,rating,num_ratings,downloaded,active_installs,last_updated",
+        "--format=json", "--quiet",
+    ], root, capture=True)
+    try:
+        plugins = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise WWError("WP-CLI returned invalid plugin search results.") from exc
+    if not isinstance(plugins, list):
+        raise WWError("Unexpected WP-CLI plugin search results.")
+    return [item for item in plugins[:10] if isinstance(item, dict) and isinstance(item.get("slug"), str)]
+
+
+def _plugin_number(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _plugin_text(value: Any) -> str:
+    return "".join(character for character in html.unescape(str(value)) if character.isprintable())
+
+
+def _compact_number(value: int | None) -> str:
+    if value is None:
+        return "?"
+    for threshold, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "k")):
+        if value >= threshold:
+            return f"{value / threshold:.1f}".removesuffix(".0") + suffix
+    return str(value)
+
+
+def _plugin_key(fd: int) -> str:
+    key = os.read(fd, 1)
+    if key == b"\x1b":
+        if select.select([fd], [], [], 0.08)[0]:
+            prefix = os.read(fd, 1)
+            if prefix in (b"[", b"O") and select.select([fd], [], [], 0.08)[0]:
+                direction = os.read(fd, 1)
+                if direction == b"A":
+                    return "up"
+                if direction == b"B":
+                    return "down"
+        return "back"
+    if key in (b"\r", b"\n"):
+        return "enter"
+    if key in (b"k", b"K"):
+        return "up"
+    if key in (b"j", b"J"):
+        return "down"
+    if key in (b"v", b"V"):
+        return "versions"
+    if key in (b"a", b"A"):
+        return "activate"
+    if key in (b"d", b"D"):
+        return "deactivate"
+    if key in (b"r", b"R"):
+        return "remove"
+    if key in (b"\x7f", b"\x08"):
+        return "back"
+    if key in (b"q", b"Q", b"\x03", b"\x04", b""):
+        return "cancel"
+    return "ignore"
+
+
+def _terminal_text(value: str, width: int) -> str:
+    output = []
+    used = 0
+    for character in value:
+        size = 0 if unicodedata.combining(character) else 2 if unicodedata.east_asian_width(character) in ("W", "F") else 1
+        if used + size > width:
+            break
+        output.append(character)
+        used += size
+    return "".join(output)
+
+
+def _terminal_width(value: str) -> int:
+    return sum(0 if unicodedata.combining(character) else 2 if unicodedata.east_asian_width(character) in ("W", "F") else 1 for character in value)
+
+
+def _terminal_cell(value: str, width: int) -> str:
+    clipped = _terminal_text(value, width)
+    if clipped != value:
+        clipped = _terminal_text(value, width - 1) + "…"
+    return clipped + " " * (width - _terminal_width(clipped))
+
+
+def _plugin_table_row(plugin: dict[str, Any], name_width: int, show_downloads: bool, selected: bool) -> str:
+    name = _terminal_cell(_plugin_text(plugin.get("name", plugin["slug"])), name_width)
+    count = _plugin_number(plugin.get("num_ratings"))
+    score = _plugin_number(plugin.get("rating"))
+    rating = "unrated" if count == 0 else f"{_compact_number(count)} · {score}%" if score is not None else f"{_compact_number(count)} ratings"
+    active = _plugin_number(plugin.get("active_installs"))
+    downloads = _plugin_number(plugin.get("downloaded"))
+    line = ("› " if selected else "  ") + name + "  " + _terminal_cell(rating, 15) + "  " + _terminal_cell(_compact_number(active) + ("+" if active is not None else ""), 9)
+    if show_downloads:
+        line += "  " + _compact_number(downloads)
+    return line.rstrip()
+
+
+def _plugin_details(plugin: dict[str, Any]) -> list[str]:
+    slug = _plugin_text(plugin["slug"])
+    name = _plugin_text(plugin.get("name", slug))
+    version = _plugin_text(plugin.get("version", "?"))
+    updated = _plugin_text(plugin.get("last_updated", "?"))[:10] or "?"
+    count = _plugin_number(plugin.get("num_ratings"))
+    score = _plugin_number(plugin.get("rating"))
+    active = _plugin_number(plugin.get("active_installs"))
+    downloads = _plugin_number(plugin.get("downloaded"))
+    rating = "No ratings yet" if count == 0 else f"{score}% from {count:,} ratings" if score is not None and count is not None else "Rating unavailable"
+    active_text = f"{active:,}+ active installs" if active is not None else "Active installs unknown"
+    downloads_text = f"{downloads:,} downloads" if downloads is not None else "Downloads unknown"
+    return [
+        "  " + name,
+        f"  {slug}  ·  v{version}  ·  updated {updated}",
+        f"  {rating}  ·  {active_text}",
+        "  " + downloads_text,
+    ]
+
+
+class _InlineMenu:
+    def __init__(self) -> None:
+        self.line_count = 0
+        self.use_color = not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+
+    def render(self, lines: list[tuple[str, str]], width: int) -> None:
+        previous = self.line_count
+        if previous:
+            sys.stdout.write(f"\x1b[{previous}F")
+        colors = {"header": "1", "muted": "2", "selected": "1;36", "detail": "1"}
+        for index in range(max(previous, len(lines))):
+            sys.stdout.write("\r\x1b[2K")
+            if index < len(lines):
+                line, style = lines[index]
+                line = _terminal_text(line, width - 1)
+                if self.use_color and style in colors:
+                    line = f"\x1b[{colors[style]}m{line}\x1b[0m"
+                sys.stdout.write(line)
+            sys.stdout.write("\n")
+        if previous > len(lines):
+            sys.stdout.write(f"\x1b[{previous - len(lines)}F")
+        sys.stdout.flush()
+        self.line_count = len(lines)
+
+
+def _plugin_picker(plugins: list[dict[str, Any]], fd: int, menu: _InlineMenu | None = None, selected: int = 0, requested_version: str | None = None) -> tuple[str, int]:
+    width, height = shutil.get_terminal_size((80, 24))
+    if height < 10 or width < 48:
+        raise WWError("Terminal is too small for the plugin picker.")
+    visible = min(len(plugins), 7, height - 9)
+    show_downloads = width >= 68
+    name_width = max(8, width - (45 if show_downloads else 34))
+    menu = menu or _InlineMenu()
+    top = max(0, min(selected, len(plugins) - visible))
+    while True:
+        if selected < top:
+            top = selected
+        elif selected >= top + visible:
+            top = selected - visible + 1
+        lines = [(f"WordPress.org plugins   {selected + 1}/{len(plugins)}   ·   most rated first", "header")]
+        headings = "  " + _terminal_cell("PLUGIN", name_width) + "  " + _terminal_cell("RATINGS · SCORE", 15) + "  " + _terminal_cell("ACTIVE", 9)
+        if show_downloads:
+            headings += "  DOWNLOADS"
+        lines.append((headings, "muted"))
+        for index in range(top, top + visible):
+            is_selected = index == selected
+            lines.append((_plugin_table_row(plugins[index], name_width, show_downloads, is_selected), "selected" if is_selected else "normal"))
+        lines.append(("  " + "─" * min(width - 4, 48), "muted"))
+        for detail_index, detail in enumerate(_plugin_details(plugins[selected])):
+            lines.append((detail, "detail" if detail_index == 0 else "normal"))
+        enter_label = f"Enter install v{requested_version} & activate" if requested_version else "Enter install & activate"
+        lines.append((f"  ↑/↓ move    {enter_label}    v versions    Esc/q cancel", "muted"))
+        menu.render(lines, width)
+        key = _plugin_key(fd)
+        if key == "up":
+            selected = max(0, selected - 1)
+        elif key == "down":
+            selected = min(len(plugins) - 1, selected + 1)
+        elif key == "enter":
+            return "install", selected
+        elif key == "versions":
+            return "versions", selected
+        elif key in ("back", "cancel"):
+            raise WWError("Selection cancelled.")
+
+
+def _version_picker(plugin: dict[str, Any], versions: list[str], current: str, fd: int, menu: _InlineMenu) -> str | None:
+    width, height = shutil.get_terminal_size((80, 24))
+    if height < 10 or width < 48:
+        raise WWError("Terminal is too small for the version picker.")
+    visible = min(len(versions), 7, height - 8)
+    selected = versions.index(current) if current in versions else 0
+    top = max(0, min(selected, len(versions) - visible))
+    name = _plugin_text(plugin.get("name", plugin["slug"]))
+    slug = _plugin_text(plugin["slug"])
+    while True:
+        if selected < top:
+            top = selected
+        elif selected >= top + visible:
+            top = selected - visible + 1
+        lines = [
+            (f"Versions for {name}   {selected + 1}/{len(versions)}", "header"),
+            (f"  {slug}  ·  current release v{current or '?'}", "muted"),
+            ("  VERSION       RELEASE", "muted"),
+        ]
+        for index in range(top, top + visible):
+            version = versions[index]
+            label = "current release" if version == current else "prerelease" if re.search(r"alpha|beta|rc|dev", version, re.IGNORECASE) else ""
+            lines.append((("› " if index == selected else "  ") + _terminal_cell("v" + version, 14) + "  " + label, "selected" if index == selected else "normal"))
+        lines.extend([
+            ("  " + "─" * min(width - 4, 48), "muted"),
+            (f"  Selected v{versions[selected]}", "detail"),
+            ("  ↑/↓ move    Enter install & activate    Esc back    q cancel", "muted"),
+        ])
+        menu.render(lines, width)
+        key = _plugin_key(fd)
+        if key == "up":
+            selected = max(0, selected - 1)
+        elif key == "down":
+            selected = min(len(versions) - 1, selected + 1)
+        elif key == "enter":
+            return versions[selected]
+        elif key == "back":
+            return None
+        elif key == "cancel":
+            raise WWError("Selection cancelled.")
+
+
+def choose_plugin(plugins: list[dict[str, Any]], requested_version: str | None = None) -> tuple[str, str | None]:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise WWError("Selection needs an interactive terminal. Run again with an exact slug.")
+    plugins = sorted(plugins, key=lambda plugin: _plugin_number(plugin.get("num_ratings")) or 0, reverse=True)
+    try:
+        fd = sys.stdin.fileno()
+        previous = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            menu = _InlineMenu()
+            selected = 0
+            while True:
+                action, selected = _plugin_picker(plugins, fd, menu, selected, requested_version)
+                plugin = plugins[selected]
+                if action == "install":
+                    return plugin["slug"], requested_version
+                width, _ = shutil.get_terminal_size((80, 24))
+                menu.render([(f"Loading versions for {_plugin_text(plugin.get('name', plugin['slug']))}…", "header")], width)
+                versions, current = plugin_versions(plugin["slug"])
+                chosen_version = _version_picker(plugin, versions, current, fd, menu)
+                if chosen_version is not None:
+                    return plugin["slug"], chosen_version
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+    except KeyboardInterrupt as exc:
+        raise WWError("Selection cancelled.") from exc
+    except (OSError, termios.error) as exc:
+        raise WWError(f"Could not open the plugin picker: {exc}") from exc
+
+
+def plugin_install(root: Path, query: str, version: str | None) -> None:
+    exact_match = exact_plugin(query)
+    if exact_match:
+        slug = query
+        if version is None and sys.stdin.isatty() and sys.stdout.isatty():
+            slug, version = choose_plugin([exact_match])
+    else:
+        plugins = search_plugins(root, query)
+        if not plugins:
+            raise WWError(f"No WordPress.org plugins found for {query!r}.")
+        slug, version = choose_plugin(plugins, version)
+    installed = run(["lando", "wp", "plugin", "is-installed", slug], root, capture=True, check=False)
+    if installed.returncode == 0 and version is None:
+        run(["lando", "wp", "plugin", "activate", slug], root)
+        return
+    command = ["lando", "wp", "plugin", "install", slug]
+    if version is not None:
+        command.append(f"--version={version}")
+        if installed.returncode == 0:
+            command.append("--force")
+    command.append("--activate")
+    run(command, root)
+
+
+def installed_plugins(root: Path) -> list[dict[str, Any]]:
+    result = run([
+        "lando", "wp", "plugin", "list", "--fields=name,title,status,version,update,update_version",
+        "--format=json", "--skip-update-check",
+    ], root, capture=True)
+    try:
+        plugins = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise WWError("WP-CLI returned invalid installed plugin data.") from exc
+    if not isinstance(plugins, list) or any(
+        not isinstance(plugin, dict) or not isinstance(plugin.get("name"), str) or not plugin["name"]
+        for plugin in plugins
+    ):
+        raise WWError("Unexpected WP-CLI installed plugin data.")
+    return plugins
+
+
+def _installed_plugin_lines(plugins: list[dict[str, Any]], selected: int, notice: str, width: int, height: int) -> list[tuple[str, str]]:
+    visible = min(len(plugins), 8, height - 8)
+    top = max(0, min(selected - visible + 1, len(plugins) - visible))
+    name_width = max(10, width - 37)
+    lines = [(f"Installed plugins   {selected + 1}/{len(plugins)}", "header")]
+    lines.append(("  " + _terminal_cell("PLUGIN", name_width) + "  " + _terminal_cell("STATUS", 12) + "  VERSION", "muted"))
+    for index in range(top, top + visible):
+        plugin = plugins[index]
+        title = _plugin_text(plugin.get("title") or plugin["name"])
+        status = _plugin_text(plugin.get("status", "?"))
+        version = _plugin_text(plugin.get("version", "?"))
+        row = ("› " if index == selected else "  ") + _terminal_cell(title, name_width) + "  " + _terminal_cell(status, 12) + "  v" + version
+        lines.append((row, "selected" if index == selected else "normal"))
+    plugin = plugins[selected]
+    slug = _plugin_text(plugin["name"])
+    title = _plugin_text(plugin.get("title") or slug)
+    update = _plugin_text(plugin.get("update_version")) if plugin.get("update") == "available" else ""
+    lines.extend([
+        ("  " + "─" * min(width - 4, 48), "muted"),
+        ("  " + title, "detail"),
+        (f"  {slug}" + (f"  ·  update available: v{update}" if update else ""), "normal"),
+    ])
+    if notice:
+        lines.append(("  " + notice, "detail"))
+    lines.append(("  ↑/↓ move    a activate    d deactivate    r remove    Esc/q exit", "muted"))
+    return lines
+
+
+def _confirm_plugin_removal(plugin: dict[str, Any], fd: int, menu: _InlineMenu, width: int) -> str:
+    slug = _plugin_text(plugin["name"])
+    title = _plugin_text(plugin.get("title") or slug)
+    lines = [
+        (f"Remove {title}?", "header"),
+        (f"  {slug}  ·  plugin files will be deleted", "normal"),
+        ("  Plugin settings and content may remain in the database.", "muted"),
+        ("  Enter remove    Esc back    q exit", "muted"),
+    ]
+    while True:
+        menu.render(lines, width)
+        key = _plugin_key(fd)
+        if key == "enter":
+            return "remove"
+        if key == "back":
+            return "back"
+        if key == "cancel":
+            return "exit"
+
+
+def plugin_list(root: Path) -> None:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise WWError("Plugin list needs an interactive terminal.")
+    plugins = installed_plugins(root)
+    if not plugins:
+        print("No installed plugins.")
+        return
+    width, height = shutil.get_terminal_size((80, 24))
+    if height < 10 or width < 48:
+        raise WWError("Terminal is too small for the plugin list.")
+    try:
+        fd = sys.stdin.fileno()
+        previous = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            menu = _InlineMenu()
+            selected = 0
+            notice = ""
+            while True:
+                width, height = shutil.get_terminal_size((80, 24))
+                if height < 10 or width < 48:
+                    raise WWError("Terminal is too small for the plugin list.")
+                panel_width = min(width, 100)
+                menu.render(_installed_plugin_lines(plugins, selected, notice, panel_width, height), panel_width)
+                key = _plugin_key(fd)
+                if key == "up":
+                    selected = max(0, selected - 1)
+                    notice = ""
+                elif key == "down":
+                    selected = min(len(plugins) - 1, selected + 1)
+                    notice = ""
+                elif key in ("back", "cancel"):
+                    return
+                elif key in ("activate", "deactivate", "remove"):
+                    plugin = plugins[selected]
+                    slug = plugin["name"]
+                    status = plugin.get("status")
+                    if status not in ("active", "inactive"):
+                        notice = f"{slug} is {status}; only regular plugins can be changed here."
+                        continue
+                    if key == "activate" and status == "active":
+                        notice = f"{slug} is already active."
+                        continue
+                    if key == "deactivate" and status == "inactive":
+                        notice = f"{slug} is already inactive."
+                        continue
+                    if key == "remove":
+                        decision = _confirm_plugin_removal(plugin, fd, menu, panel_width)
+                        if decision == "exit":
+                            return
+                        if decision == "back":
+                            notice = ""
+                            continue
+                    menu.render([(f"Working on {slug}…", "header")], panel_width)
+                    try:
+                        if key == "remove" and status == "active":
+                            run(["lando", "wp", "plugin", "deactivate", slug], root, capture=True)
+                        action = "delete" if key == "remove" else key
+                        run(["lando", "wp", "plugin", action, slug], root, capture=True)
+                        plugins = installed_plugins(root)
+                    except WWError as exc:
+                        notice = _plugin_text(str(exc))
+                        try:
+                            plugins = installed_plugins(root)
+                            selected = next((index for index, item in enumerate(plugins) if item["name"] == slug), min(selected, len(plugins) - 1))
+                            if not plugins:
+                                menu.render([("No installed plugins.", "header")], panel_width)
+                                return
+                        except WWError:
+                            pass
+                        continue
+                    if not plugins:
+                        menu.render([("No installed plugins.", "header")], panel_width)
+                        return
+                    selected = min(selected, len(plugins) - 1)
+                    notice = f"{slug} {'removed' if key == 'remove' else 'activated' if key == 'activate' else 'deactivated'}."
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+    except KeyboardInterrupt:
+        return
+    except (OSError, termios.error) as exc:
+        raise WWError(f"Could not open the plugin list: {exc}") from exc
+
+
+def discover_tricks() -> list[dict[str, Any]]:
+    if not TRICKS_DIR.is_dir():
+        return []
+    tricks = []
+    try:
+        folders = sorted(TRICKS_DIR.iterdir())
+    except OSError as exc:
+        raise WWError(f"Cannot list tricks in {TRICKS_DIR}: {exc}") from exc
+    for folder in folders:
+        if not folder.is_dir():
+            continue
+        slug = folder.name
+        if folder.is_symlink() or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug):
+            raise WWError(f"Invalid trick folder: {folder}.")
+        manifest = folder / "manifest.json"
+        entrypoint = folder / "run.py"
+        if manifest.is_symlink():
+            raise WWError(f"Invalid trick manifest symlink: {manifest}.")
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise WWError(f"Cannot read trick manifest {manifest}: {exc}") from exc
+        if not isinstance(data, dict) or any(
+            not isinstance(data.get(field), str) or not data[field].strip()
+            for field in ("name", "description")
+        ):
+            raise WWError(f"Invalid trick manifest {manifest}: name and description are required.")
+        if not entrypoint.is_file() or entrypoint.is_symlink():
+            raise WWError(f"Missing or invalid trick entry point: {entrypoint}.")
+        tricks.append({"slug": slug, "name": data["name"], "description": data["description"], "entrypoint": entrypoint})
+    return tricks
+
+
+def choose_trick(tricks: list[dict[str, Any]]) -> str | None:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise WWError("The tricks menu needs an interactive terminal. Use `ww tricks <slug>` to run directly.")
+    width, height = shutil.get_terminal_size((80, 24))
+    if width < 48 or height < 8:
+        raise WWError("Terminal is too small for the tricks menu.")
+    try:
+        fd = sys.stdin.fileno()
+        previous = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            menu = _InlineMenu()
+            selected = 0
+            top = 0
+            while True:
+                width, height = shutil.get_terminal_size((80, 24))
+                if width < 48 or height < 8:
+                    raise WWError("Terminal is too small for the tricks menu.")
+                panel_width = min(width, 100)
+                visible = min(len(tricks), 8, height - 6)
+                if selected < top:
+                    top = selected
+                elif selected >= top + visible:
+                    top = selected - visible + 1
+                wide = panel_width >= 74
+                name_width = 24 if wide else max(12, panel_width - 22)
+                slug_width = 18 if wide else 16
+                lines = [(f"Tricks   {selected + 1}/{len(tricks)}", "header")]
+                heading = "  " + _terminal_cell("TRICK", name_width) + "  " + _terminal_cell("SLUG", slug_width)
+                if wide:
+                    heading += "  DESCRIPTION"
+                lines.append((heading, "muted"))
+                for index in range(top, top + visible):
+                    trick = tricks[index]
+                    row = ("› " if index == selected else "  ") + _terminal_cell(_plugin_text(trick["name"]), name_width)
+                    row += "  " + _terminal_cell(trick["slug"], slug_width)
+                    if wide:
+                        row += "  " + _plugin_text(trick["description"])
+                    lines.append((row.rstrip(), "selected" if index == selected else "normal"))
+                lines.extend([
+                    ("  " + "─" * min(panel_width - 4, 48), "muted"),
+                    ("  " + _plugin_text(tricks[selected]["description"]), "detail"),
+                    ("  ↑/↓ move    Enter run    Esc/q exit", "muted"),
+                ])
+                menu.render(lines, panel_width)
+                key = _plugin_key(fd)
+                if key == "up":
+                    selected = max(0, selected - 1)
+                elif key == "down":
+                    selected = min(len(tricks) - 1, selected + 1)
+                elif key == "enter":
+                    menu.render([], panel_width)
+                    return tricks[selected]["slug"]
+                elif key in ("back", "cancel"):
+                    menu.render([], panel_width)
+                    return None
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+    except KeyboardInterrupt:
+        return None
+    except (OSError, termios.error) as exc:
+        raise WWError(f"Could not open the tricks menu: {exc}") from exc
+
+
+def show_tricks(root: Path, slug: str | None = None) -> int:
+    tricks = discover_tricks()
+    if not tricks:
+        raise WWError("No tricks are installed.")
+    if slug is None:
+        slug = choose_trick(tricks)
+        if slug is None:
+            return 0
+    trick = next((item for item in tricks if item["slug"] == slug), None)
+    if trick is None:
+        raise WWError(f"Unknown trick {slug!r}. Available: {', '.join(item['slug'] for item in tricks)}")
+    print(f"Running {trick['name']} ({slug})…", flush=True)
+    return run([sys.executable, str(trick["entrypoint"]), str(root)], root, check=False).returncode
+
+
+def complete_tricks() -> None:
+    for trick in discover_tricks():
+        print(f"{trick['slug']}\t{_plugin_text(trick['name'])} — {_plugin_text(trick['description'])}")
+
+
+def complete_running() -> None:
+    for project in list_projects():
+        if project["status"] in ("running", "partial"):
+            print(f"{project['name']}\t{project['root']}")
+
+
+def complete_wp(line: str) -> None:
+    try:
+        root = project_root()
+        result = run(["lando", "wp", "cli", "completions", f"--line={line}", f"--point={len(line)}"], root, capture=True, check=False)
+        if result.returncode == 0:
+            # WP-CLI emits trailing spaces for bash to insert after commands.
+            # Fish inserts its own separator; spaces here become part of a token.
+            for candidate in result.stdout.splitlines():
+                candidate = candidate.rstrip()
+                if candidate:
+                    print(candidate)
+    except WWError:
+        pass
+
+
+def plugin_install_usage() -> None:
+    print("Usage: ww plugin install <slug-or-search> [version]")
+    print("Arguments:")
+    print("  slug-or-search  WordPress.org plugin slug or search term")
+    print("  version         Optional plugin version")
+    print("Options:")
+    print("  --help, -h      Show this help")
+    print("Picker: Up/Down to move, Enter to install and activate, v to choose a version.")
+    print("Version picker: Esc to return. Press q to cancel either picker.")
+
+
+def usage() -> None:
+    print("Usage: ww <command> [arguments]")
+    print("Commands: " + ", ".join(COMMANDS))
+    print("Plugin install: ww plugin install <slug-or-search> [version]")
+    print("Plugin list: ww plugin list")
+    print("Tricks: ww tricks [slug]")
+    print("Instance overview: ww status (alias: ww info)")
+    print("Stop or destroy: ww stop [site], ww destroy [site]")
+    print("Stop all running sites from anywhere: ww stop-all")
+    print("reset-db deletes local database data and reinstalls; destroy deletes it and keeps source.")
+    print("Both require confirmation and create no backup. See README for recovery and setup.")
+
+
+def main(args: list[str] | None = None) -> int:
+    args = sys.argv[1:] if args is None else args
+    try:
+        if not args or args in (["help"], ["--help"], ["-h"]):
+            usage()
+            return 0
+        command, *rest = args
+        if command == "__complete_wp":
+            if len(rest) == 1:
+                complete_wp(rest[0])
+            return 0
+        if command == "__complete_tricks" and not rest:
+            complete_tricks()
+            return 0
+        if command == "__complete_running" and not rest:
+            complete_running()
+            return 0
+        if command == "create" and not rest:
+            create()
+        elif command == "list" and not rest:
+            show_list()
+        elif command == "start" and not rest:
+            run(["lando", "start"], project_root())
+        elif command == "stop" and len(rest) <= 1:
+            run(["lando", "stop"], named_project_root(rest[0]) if rest else project_root())
+        elif command == "stop-all" and not rest:
+            stop_all()
+        elif command in ("status", "info") and not rest:
+            show_status(project_root())
+        elif command == "reset-db" and not rest:
+            reset_db(project_root())
+        elif command == "destroy" and len(rest) <= 1:
+            destroy(named_project_root(rest[0]) if rest else project_root())
+        elif command == "wp":
+            root = project_root()
+            return run(["lando", "wp", *rest], root, check=False).returncode
+        elif command == "plugin" and rest in (["install", "--help"], ["install", "-h"]):
+            plugin_install_usage()
+        elif command == "plugin" and len(rest) in (2, 3) and rest[0] == "install":
+            plugin_install(project_root(), rest[1], rest[2] if len(rest) == 3 else None)
+        elif command == "plugin" and rest == ["list"]:
+            plugin_list(project_root())
+        elif command == "tricks" and len(rest) <= 1:
+            return show_tricks(project_root(), rest[0] if rest else None)
+        else:
+            usage()
+            return 2
+    except WWError as exc:
+        print(f"ww: {exc}", file=sys.stderr)
+        return 1
+    except (OSError, UnicodeError) as exc:
+        print(f"ww: Could not access project data: {exc}. Inspect any partial changes before retrying.", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nww: Interrupted. Any completed changes remain; inspect the site before retrying.", file=sys.stderr)
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

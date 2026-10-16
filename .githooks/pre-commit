@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+cd "$(git rev-parse --show-toplevel)"
+git diff --cached --check
+exec python3 -W default tools/check.py --quick

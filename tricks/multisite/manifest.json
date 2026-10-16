@@ -1,0 +1,4 @@
+{
+  "name": "Convert to multisite",
+  "description": "Turn this WordPress site into a subdirectory-based multisite network."
+}
