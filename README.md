@@ -5,6 +5,10 @@ repeating Lando setup. `ww` is a small Python standard-library wrapper for perso
 local development; it stores WordPress source and database data beside the site
 configuration. It is not a hosted service or a backup tool.
 
+![ww status showing a running demo WordPress site, runtime versions, database size, and installed plugins](docs/images/ww-status.png)
+
+*Example status output using synthetic demo data.*
+
 [Command reference](docs/REFERENCE.md) · [Recovery](#recovery) ·
 [Development and checks](docs/DEVELOPMENT.md) · [Changes](CHANGELOG.md)
 
